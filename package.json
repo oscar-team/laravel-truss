@@ -1,0 +1,19 @@
+{
+  "name": "laravel-truss",
+  "private": true,
+  "type": "module",
+  "description": "Client-side diagram logic for oscar-team/laravel-truss (no build step; shipped as native ES modules). Derived from albertoarena/laravel-truss.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:a11y": "playwright test tests/e2e/a11y.spec.js"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@playwright/test": "^1.61.1",
+    "mermaid": "^11.16.0",
+    "vitest": "^4.1.10"
+  }
+}

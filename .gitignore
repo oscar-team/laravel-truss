@@ -1,0 +1,28 @@
+# Dependencies
+/vendor/
+composer.lock
+/node_modules/
+/package-lock.json
+
+# Playwright
+/test-results/
+/playwright-report/
+/.playwright/
+
+# Test / tooling caches
+/.phpunit.cache/
+.phpunit.result.cache
+/build/
+/coverage/
+
+# Private/local docs (note: the tracked docs/ folder is NOT ignored)
+/.docs/
+
+# IDE files
+/.idea/
+/.vscode/
+*.iml
+
+# Local Claude files
+CLAUDE.local.md
+CLAUDE.*.local.md

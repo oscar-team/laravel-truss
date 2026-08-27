@@ -1,0 +1,89 @@
+{
+    "name": "oscar-team/laravel-truss",
+    "description": "Oscar Mobility's Laravel 10 port of Alberto Arena's Laravel Truss: a live database structure viewer. Renders your schema (never data) as a scrollable, zoomable ER diagram.",
+    "keywords": [
+        "laravel",
+        "laravel-10",
+        "database",
+        "schema",
+        "er-diagram",
+        "erd",
+        "database-diagram",
+        "dbml",
+        "data-dictionary",
+        "migrations",
+        "mermaid",
+        "introspection"
+    ],
+    "homepage": "https://trussphp.com",
+    "support": {
+        "docs": "https://trussphp.com",
+        "source": "https://github.com/albertoarena/laravel-truss"
+    },
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Oscar Mobility",
+            "role": "Maintainer (Laravel 10 port)",
+            "homepage": "https://github.com/oscar-team/laravel-truss"
+        },
+        {
+            "name": "Alberto Arena",
+            "email": "arena.alberto@gmail.com",
+            "homepage": "https://github.com/albertoarena/laravel-truss",
+            "role": "Original author"
+        }
+    ],
+    "funding": [
+        {
+            "type": "ko-fi",
+            "url": "https://ko-fi.com/albertoarena"
+        }
+    ],
+    "require": {
+        "php": "^8.1",
+        "illuminate/contracts": "^10.48.9",
+        "illuminate/support": "^10.48.9",
+        "spatie/laravel-package-tools": "^1.16"
+    },
+    "require-dev": {
+        "laravel/pint": "^1.18",
+        "orchestra/testbench": "^8.22",
+        "pestphp/pest": "^2.36",
+        "pestphp/pest-plugin-laravel": "^2.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "OscarMobility\\Truss\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "OscarMobility\\Truss\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/pest",
+        "test:coverage": "vendor/bin/pest --coverage",
+        "lint": "vendor/bin/pint --test",
+        "lint:fix": "vendor/bin/pint"
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        },
+        "audit": {
+            "block-insecure": false
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "OscarMobility\\Truss\\TrussServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

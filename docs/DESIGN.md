@@ -1,0 +1,254 @@
+# Design
+
+## Purpose
+
+Truss gives a Laravel app a live, always-current view of its database structure, in the app, without ever touching row data. It's built for the moment you're staring at an unfamiliar codebase (or your own, six months later) and want to see how the tables actually connect, without opening a DB client or reverse-engineering migrations by hand.
+
+## Architecture Overview
+
+Truss has three layers, kept deliberately separate so each is testable in isolation.
+
+### 1. Snapshot builder (`src/Introspection/`)
+
+The core of the package. Given the app's migrations, it produces a plain, serializable schema representation.
+
+**How it works:**
+1. Resolve the target connection — the app's **default** database connection unless a specific one is requested (see Config below).
+2. Introspect that live connection's current schema: tables, columns (name, type, nullable, default), indexes, and foreign keys.
+3. Serialize into a plain array/JSON structure.
+
+**Fallback (no connection available):** if no database connection is reachable, replay migrations against a fresh in-memory SQLite connection and introspect *that* instead. Replay **all migration paths the Laravel migrator knows about** (the app's `database/migrations` *and* package migrations registered via `loadMigrationsFrom`), resolved through the migrator rather than a hardcoded directory — so the fallback matches what `php artisan migrate` would actually produce. This is a degraded mode: SQLite storage classes replace native types, and driver-specific migrations may not replay cleanly. Replay is **graceful per-migration** — a migration that fails on SQLite is skipped and recorded, not fatal, and the snapshot is built from whatever replayed successfully. The UI surfaces a banner: *"A database connection is not available; SQLite fallback used"* and lists any skipped migrations. The structure-only guarantee holds in both modes.
+
+Reading the live schema is preferred over static AST-parsing of migration files (which contain loops, conditionals, and raw SQL that are unreliable to parse statically) and over always replaying on SQLite (which loses native types and breaks on driver-specific migrations). The SQLite replay survives only as the no-connection fallback.
+
+**Output shape (indicative):**
+
+```json
+{
+  "connection": "mysql",
+  "generated_at": "2026-07-22T10:00:00Z",
+  "tables": [
+    {
+      "name": "posts",
+      "columns": [
+        { "name": "id", "type": "bigint unsigned", "nullable": false, "default": null },
+        { "name": "user_id", "type": "bigint unsigned", "nullable": false, "default": null },
+        { "name": "title", "type": "varchar(255)", "nullable": false, "default": null }
+      ],
+      "primary_key": ["id"],
+      "indexes": [
+        { "name": "posts_user_id_index", "columns": ["user_id"], "unique": false }
+      ],
+      "foreign_keys": [
+        {
+          "name": "posts_user_id_foreign",
+          "columns": ["user_id"],
+          "references_table": "users",
+          "references_columns": ["id"],
+          "on_update": "no action",
+          "on_delete": "cascade"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Keys are modelled composite-first. `primary_key`, each index's `columns`, and a foreign key's `columns`/`references_columns` are all arrays, so composite primary keys (`"primary_key": ["post_id", "tag_id"]` on a pivot), composite indexes, and composite foreign keys are first-class. The primary key lives at table level, not in `indexes` (which holds only non-primary indexes); a table with no primary key serialises `"primary_key": []`. Per-column `PK`/`FK` badges in the diagram are **derived** by the generator from `primary_key` and `foreign_keys[].columns` — not stored redundantly on each column. Foreign-key referential actions (`on_update`/`on_delete`) are structure, not data, and are carried for display.
+
+`type` is the **native full type** exactly as the database reports it (`varchar(255)`, `bigint unsigned`, `timestamp`) — the source of truth, never a reverse-mapped Laravel migration verb. Mapping a native type back to a Laravel-style name (`string`, `integer`) is inference, is lossy, and is therefore *not* done here; it is an optional presentation-layer label (see Frontend).
+
+This layer has no knowledge of HTTP, Blade, caching, or Mermaid. It is a pure function: connection in, schema representation out. See `.claude/rules/introspection.md` for the rules that keep it that way.
+
+### 2. Cache & rebuild trigger (`src/Cache/`, service provider)
+
+- The snapshot is stored via Laravel's `Cache` facade, keyed per connection, with a configurable TTL.
+- Rebuilds are triggered automatically by listening to `Illuminate\Database\Events\MigrationsEnded`, fired after `migrate`, `migrate:rollback`, and `migrate:fresh`.
+- A manual `php artisan truss:rebuild` command is available for CI, seeding workflows, or forcing a refresh.
+- No database table is used for storage. This is disposable, derived data.
+- **Every cache operation degrades instead of throwing.** An unusable store (`CACHE_STORE=database` before the `cache` table exists, an unreachable Redis) must not be able to break things that do not depend on it: a read falls back to a live build that is simply not cached, `lastError()` reports why, and the `MigrationsEnded` listener never throws, because an exception there fails the host app's `php artisan migrate` on a migration that already succeeded. `truss:rebuild` is the deliberate exception and still exits non-zero, since storing the snapshot is its only job.
+- On each `MigrationsEnded`, before the cache is overwritten, the snapshot that is currently cached (the pre-migration schema) is captured as the **schema-diff baseline** (see section 4). This is the one place that knows a migration just ran, and the cache is the only remaining source of the previous schema once the migration has completed.
+
+### 3. HTTP layer (`src/Http/`)
+
+Two routes, matching the "index page + JSON endpoint" pattern used by in-app admin dashboards:
+
+- `GET {route_prefix}` — renders the Blade shell (layout, connection switcher, container for the diagram).
+- `GET {route_prefix}/api/schema?connection=...` — returns the cached schema JSON for the requested connection, with config `excluded_tables` filtered out **server-side** so they never reach the client. The response also carries a `diff` field (the structural diff against the recorded baseline, or `null` when the feature is off or no baseline exists yet), plus a `diff_unavailable` flag when the baseline could not be read at all, which is a distinct case from having none and is surfaced as a dashboard notice, and a `cache_unavailable` flag when the snapshot had to be read live because the cache store could not be reached (also a notice; the structure itself is complete); the baseline is filtered through the same exclusion list, so an excluded table never surfaces via the diff either. The frontend fetches from this endpoint and builds the Mermaid `erDiagram` definition client-side, applying interactive filter/focus to what it received.
+
+Both routes sit behind a **fixed `viewTruss` gate** (a fixed ability name). The package ships a default definition that allows access in `local` only; the host app customizes *who* may view by redefining the `viewTruss` gate in its own service provider. The ability name is not configurable — only its callback is, and that lives in the app, not in config.
+
+#### Authorization model
+
+Truss is designed to be safe to install in **production** and gated there — not merely a local-only tool. Access is guarded by two independent layers, enforced by the `Authorize` middleware, plus the auth-context middleware that runs ahead of it:
+
+1. **`truss.enabled`** — when off, the routes respond **404**, behaving as if they do not exist. Defaults to local-only, so a production deploy is dark until you set `TRUSS_ENABLED=true`. This is the deploy switch: "does the dashboard exist in this environment at all".
+2. **The `viewTruss` gate** — the access control: "who may view". It is consulted **only in non-local** environments (local is unconditionally open). A denial returns **404**, not 403, so the dashboard never confirms it exists to someone who may not see it.
+
+`enabled` alone does not grant access, and the gate alone does not make the routes exist. To expose Truss in a non-local environment (staging or production), a host must **both** set `TRUSS_ENABLED=true` *and* authorize the viewers.
+
+**Establishing the auth context.** The gate can only identify the viewer if the request has already passed through session/auth middleware. The `truss.middleware` config key (default `['web']`) supplies that stack; the fixed `viewTruss` guard is always appended after it and cannot be configured away. Without this, `$request->user()` would be `null` in production and the gate would deny *everyone*, including the admins who should have access — so the middleware stack is load-bearing, not cosmetic. Apps that authenticate differently (a custom guard, Sanctum for an SPA) swap the stack here.
+
+**Authorizing specific users — the zero-code path.** For the common "let these admins in" case, the shipped default `viewTruss` gate admits the emails in `truss.authorization.allowed_emails`, set via `TRUSS_ALLOWED_EMAILS` as a comma-separated list:
+
+```dotenv
+TRUSS_ENABLED=true
+TRUSS_ALLOWED_EMAILS="ada@example.com,grace@example.com"
+```
+
+No gate code is needed. The list is ignored in local (the gate is not consulted there) and **fails closed** — an empty list means no one may view in non-local until emails are added or the gate is overridden. A guest resolves to a `null` user and is denied.
+
+**Authorizing by role — override the gate.** When email lists aren't enough (e.g. a role or permission check), the host defines its own `viewTruss` gate in a service provider. A host definition fully replaces the default and the allow-list is then unused:
+
+```php
+use App\Models\User;
+use Illuminate\Support\Facades\Gate;
+
+Gate::define('viewTruss', fn (User $user) => $user->isAdmin());
+```
+
+The host definition always wins (the package registers its default only if the app has not already defined the gate, and a later app definition overrides it regardless of order). The ability *name* is fixed — only the callback varies, and that lives in the app. See `DECISIONS.md` → *Authorization: production-gated model*.
+
+### 4. Schema diff (`src/Diff/`)
+
+"What changed since the last migration", built from two pieces:
+
+- **`SchemaDiffer`** is a pure function over two serialized snapshots (baseline, current). It returns a plain diff array: tables added / removed / changed, and within a changed table, columns / indexes / foreign keys added / removed / changed plus a primary-key change. Matching is by name, so a rename reads as a remove plus an add (a documented limitation). It touches no framework, no I/O, and no database, so it is unit-tested with plain array fixtures, and it cannot expose row data because both inputs are already structure-only.
+- **`BaselineStore`** persists the baseline as a structure-only JSON file on a configurable Laravel disk (`truss.diff.disk`, `local` by default), at `truss/baselines/{connection}.json`. It is the **only** thing Truss writes to the filesystem. Every operation degrades instead of throwing: a read failure is indistinguishable from an absent baseline (both yield an empty diff), a write failure returns false, and `lastError()` lets a caller that can act on it say something useful. This matters because the store serves one secondary feature but is reached from three places, including the `MigrationsEnded` listener, where an escaping exception would fail the host app's `php artisan migrate`. The baseline lives on disk rather than in the cache because it is the one piece of state Truss cannot rebuild from the live database: once the migration has run, the previous schema exists nowhere else.
+
+Both surfaces read the same engine: the dashboard "Changes" panel (fed by the `diff` API field, tinting added and changed tables and listing every change, with removed tables list-only; each added or changed table name in the panel is a focus link that jumps the diagram to that table) and the `php artisan truss:diff` command (the terminal counterpart, structure-only, safe in CI).
+
+The whole feature is gated by `truss.diff.enabled` (default true). When false, no baseline is captured, nothing is written to disk, the API returns `diff: null`, the dashboard button is hidden, and `truss:diff` reports the feature is off. The check runs before any filesystem touch, so a host that disables it can be certain Truss leaves the disk untouched. See `DECISIONS.md` → *Schema diff: durable baseline on disk*.
+
+## Frontend
+
+- Mermaid.js renders the ER diagram from the JSON schema, no build step required.
+- **Accessibility of the diagram surface.** The three in-diagram triggers (table name, enum type label, health marker) are given `role="button"` and `tabindex="0"` when the SVG is annotated, so they are answered by Enter and Space through one delegated `keydown` handler on the canvas, mirroring the delegated `click` handler beside it. Opening a menu from the keyboard moves focus into it and remembers the trigger; Escape closes the popover and hands focus back (WCAG 2.1.1 and 2.1.2). Each trigger has a `:focus-visible` outline, deliberately a shape change rather than a recolour, since hover already uses colour. The generated definition carries `accTitle` and `accDescr`, which Mermaid renders as `<title>` and `<desc>`, giving the SVG an accessible name and a description that tracks the current table and relationship counts, filter, and focus (WCAG 1.1.1). The filter text is user input and is sanitised into the quoted `accDescr` value, since a newline there would terminate the directive and corrupt the diagram. Guarded by `tests/e2e/a11y.spec.js` (keyboard behaviour plus an axe-core scan of the dashboard and its overlays) and `tests/js/a11y-css.test.js` (the focus indicator, asserted against the shipped stylesheet because the browser harness carries its own inlined copy).
+- **Pan/zoom.** The viewport clips; the rendered SVG sits on a canvas transformed by `translate(x, y) scale(zoom)` (never a re-layout). The diagram **auto-fits** the viewport whenever the content changes (load, filter, focus, connection switch) so it is never stranded tiny or at a stale zoom — but a label toggle keeps your current view. The auto-fit honours a **readable floor** (`diagram.min_zoom`, default `0.7`): a large schema is framed at a legible zoom that you pan around rather than an unreadable speck. The explicit **Fit** button ignores the floor and frames the whole diagram at once, so the full overview is one click away. Manual control is Google-Maps-style: wheel zooms toward the cursor, drag pans (text selection is suppressed on the canvas), plus a zoom slider. The fit/zoom math is a pure, unit-tested module (`resources/js/viewport.js`).
+- **Selection pipeline.** Table selection happens in two places, split by nature:
+  - *Config `excluded_tables`* — applied **server-side**: removed from the API response entirely, so their structure never reaches the browser (kept out of the payload, not hidden via CSS). The cached snapshot stays the full schema; exclusions are applied when serving, so toggling `excluded_tables` needs no rebuild.
+  - *Filter and focus* — applied **client-side** on the received JSON, both feeding the same `MermaidDefinitionGenerator`. Filter (text search / table multiselect) and focus mode (a table plus its foreign-key neighbours, depth 1, configurable) are the same operation with different predicates, and they compose: focus operates on whatever the filter left in.
+
+  The rule: permanent exclusions are server-side (never sent), transient interactive selection is client-side (no refetch).
+- **Type label toggle.** Columns show the native full type by default (`varchar(255)`, `bigint unsigned`). A toggle switches to a best-effort Laravel-style short label (`string`, `integer`), computed here in the presentation layer from the native type — clearly lossy, never fed back into the schema output. The default mode is config-driven (`diagram.type_labels`). `enum(...)`/`set(...)` value lists collapse to just the keyword so they don't blow out the column width; the compacted `enum` label becomes a clickable accent that opens a popover of the allowed values (tap-friendly, so it works on touch). Hovering any type cell also shows the full native type as a title.
+- **Large-schema support (50+ tables) from day one.** Focus mode is the primary answer — reducing to a table and its neighbours keeps both layout time and legibility under control. Mermaid's `maxTextSize`/`maxEdges` guards are raised so large schemas render instead of erroring; a soft warning appears above a configurable table threshold.
+- **Focus picker.** A searchable combobox rather than a native `<select>`: at a couple of hundred tables a select is a long scrolling list whose only search is the browser's prefix jump, which never reaches `order_items` from `item` and shows nothing about what it matched. Matching is substring and case-insensitive, ranked exact then prefix then substring, with the matched span marked in each row, so it agrees with the toolbar filter instead of contradicting it. The matcher is a pure, unit-tested module (`resources/js/table-match.js`); the widget (`resources/js/focus-combobox.js`) implements the ARIA combobox-with-listbox pattern, keeping DOM focus in the input and tracking the active option with `aria-activedescendant`, which is what keeps it clear of the focus-trap problems a roving-focus menu has. A live region announces the match count while you type, which the select could never do. Every path that focuses a table (the URL, the per-table menu, the Changes and Health panels, Clear focus) goes through one `setFocus()`, so the control's shape is not baked into its callers.
+
+- **Entity outline.** Mermaid paints the outer entity path first and then a full-width rect per row, and those row rects share the entity's left and right edges, so stroking them in the hairline colour repaints the outline everywhere below the title (issue #35). SVG has no `z-index` and CSS cannot stroke only two sides of a closed path, so the outline is re-drawn: after each render the stroked half of the outer path is cloned into a trailing `g.outer-path.truss-entity-outline`, which paints last. Keeping the `outer-path` class means the focused, diff and health overrides reach the clone with no extra rules, and the row hairlines survive. Guarded by `tests/e2e/entity-border.spec.js`, which injects the shipped stylesheet so it asserts painted colour rather than harness colour.
+
+- **Deep-linkable views.** The current connection, filter, focus, depth, and type-label mode are reflected in the URL query string (for example `/truss?focus=projects`), updated live via `history.replaceState`. On load the query string seeds the initial view, so a focused or filtered view can be bookmarked, shared, and reopened. The serialize/parse logic is a pure, unit-tested module (`resources/js/url-state.js`).
+- **Per-table export/focus menu.** Clicking a table name (a subtle, hover-revealed accent, reusing the same clickable-label trick as the enum popover rather than a fragile injected icon) opens a small menu in the shared popover: *Focus this table* (or *Unfocus this table* when it is already the focus), *Copy JSON*, *Download JSON*, *Download CSV*, *Download Markdown*. Exports are generated client-side from the snapshot already in the browser and are **structure only** (columns, keys, indexes), consistent with the no-data guarantee. JSON is the full table structure; CSV is a flat column view with a derived `PK`/`FK` key column; Markdown is a single data-dictionary section. The serializers are pure, unit-tested modules (`resources/js/table-export.js`, `resources/js/markdown-export.js`).
+- **Diagram image export (PNG/SVG).** A toolbar button exports the whole current diagram (the current filter/focus selection) as a PNG or SVG. It is fully client-side and dependency-free, in keeping with the no-CDN, CSP-safe stance: the rendered SVG is cloned, its CSS-driven shape colours are inlined, every HTML label (a Mermaid `foreignObject`, which neither rasterises to canvas nor opens in vector tools) is flattened to a positioned SVG `<text>` mapped through the live CTM, the IBM Plex Mono weights are embedded as base64 `@font-face`, and a solid themed background is painted. SVG serialises that directly. PNG draws it to a canvas and `toBlob`s it, at 2× where the diagram has room for it and stepped down towards 1× where it does not: a canvas has a hard pixel ceiling (around 268 MP in Chrome, lower elsewhere), and past it the browser returns a blank canvas whose `toBlob` yields `null`. A diagram too large to rasterise even at 1× is not offered as PNG at all, with the menu saying so and pointing at SVG, which has no such limit. The scale never drops below 1×, since downscaling discards the pixels that make the labels legible, which is the only reason to want a raster. Structure only, and theme-matched.
+- **Data dictionary and DBML export.** The same export button also offers two whole-schema text exports of the current selection: a **Markdown data dictionary** (one section per table with columns, keys, indexes, and foreign keys, for pasting into a README or wiki) and a **DBML** file (opens in dbdiagram.io and other DBML tools). Both are pure, unit-tested serializers (`resources/js/markdown-export.js`, `resources/js/dbml-export.js`), client-side and structure only. DBML `Ref:` lines are emitted only when both endpoint tables are in the exported selection, so a filtered or focused export stays valid. The native-to-DBML type mapping is deliberately lossy (the native type is passed through, quoted when it would otherwise misparse), the same stance as the native-versus-Laravel label caveat above; enums stay a quoted type string rather than becoming DBML `Enum` blocks.
+- Connection switcher re-fetches from the JSON endpoint and re-renders, no full page reload.
+- When the snapshot was built via the SQLite fallback, a banner states the connection was unavailable and native types may be approximate.
+
+### Asset delivery (self-hosted, no build, no CDN)
+
+The frontend ships as native ES modules plus a stylesheet, served from the package by a **gated asset route** (`GET {route_prefix}/assets/{file}`) — no `vendor:publish` step and nothing on `public/`. The `{file}` param is allow-listed by basename, which both maps names to paths and makes traversal impossible. The route sits inside the same gated group as the page, so unauthorized users get 404 on the assets too — they never confirm Truss is installed (consistent with the 404-on-denial decision).
+
+Mermaid is **vendored** (a copy of `mermaid.min.js` in the package) and served from the same route, so there is no CDN dependency by default and a strict CSP needs only `script-src 'self'`. A host that prefers a CDN or its own copy sets `diagram.mermaid_url` (`TRUSS_MERMAID_URL`); when null (default) Mermaid is self-hosted. The **IBM Plex Mono** font (the Blueprint UI face, used for the chrome and the diagram type labels) is likewise vendored as `woff2` in `resources/fonts/` and served from the route via `@font-face` — no font CDN, so `font-src 'self'` suffices.
+
+**CSP note.** With self-hosting, our own script and stylesheet need only `'self'` (the CSS is a served file, not inlined). Mermaid, however, injects a `<style>` element into the rendered SVG at runtime, so a strict policy still needs `style-src 'self' 'unsafe-inline'`. That is a Mermaid limitation, not something Truss can remove without patching it; it is documented rather than worked around.
+
+## Config reference (`config/truss.php`)
+
+| Key | Purpose |
+|---|---|
+| `route_prefix` | URL prefix for the index page and API endpoint |
+| `enabled` | Global on/off switch, expected to default to `env('APP_ENV') === 'local'` |
+| `cache.ttl` | How long a schema snapshot is cached before being considered stale |
+| `connections` | Which configured DB connections are visualizable, and any per-connection overrides. Defaults to the app's default connection when unset |
+| `excluded_tables` | Tables hidden by default (e.g. `sessions`, `jobs`, `cache`, `cache_locks`), toggleable |
+| `diagram` | Styling options passed through to the Mermaid theme (colors, font, spacing) |
+| `diagram.type_labels` | Default column-type label mode: `native` (full DB type, default) or `laravel` (best-effort short label); user-toggleable in the UI |
+| `diagram.mermaid_url` | Where the browser loads Mermaid from. Null (default) self-hosts it from the package's asset route (no CDN); set a URL to opt into a CDN or a custom copy |
+| `diagram.min_zoom` | readable floor for the automatic fit-to-screen (default `0.7`): a large schema is never auto-zoomed below this. The Fit button ignores it |
+| `middleware` | Middleware stack wrapping the routes, establishing the auth context so the gate sees the user (default `['web']`); the fixed `viewTruss` guard is always appended |
+| `authorization.allowed_emails` | Emails admitted by the default `viewTruss` gate in non-local environments (`TRUSS_ALLOWED_EMAILS`); ignored in local and when the host overrides the gate |
+| `focus.default_depth` | Foreign-key neighbour depth shown when focusing a table (default `1`) |
+| `large_schema.warn_above` | Table count above which the UI shows a "large schema — use focus/filter" warning |
+| `diff.enabled` | Master switch for schema diff (default `true`, `TRUSS_DIFF_ENABLED`). When false, no baseline is captured, nothing is written to disk, the "Changes" panel is hidden, and `truss:diff` reports the feature is off |
+| `diff.disk` | Filesystem disk the diff baseline is written to (`TRUSS_DIFF_DISK`); null uses the app's default disk. The path is always `truss/baselines/{connection}.json` |
+
+## Out of scope for v1
+
+- **Semantic relationship labels from Eloquent models** — inferring "author" instead of `user_id → users.id` by scanning model relationship methods. Nice-to-have, not required since foreign keys already produce a correct diagram.
+
+_Focus mode was originally deferred to v2 but is now v1: it is the primary large-schema legibility and performance mechanism, and it shares the selection pipeline with filtering, so the marginal cost is small._
+
+## Future enhancements (backlog)
+
+Post-v1 ideas, not yet scheduled:
+
+- **Semantic relationship labels from Eloquent models** (see *Out of scope for v1* above).
+
+## Directory structure
+
+```
+├── CLAUDE.md
+├── README.md
+├── LICENSE
+├── composer.json
+├── config/
+│   └── truss.php
+├── docs/
+│   ├── DESIGN.md
+│   ├── INSTRUCTIONS.md
+│   └── DECISIONS.md
+├── src/
+│   ├── TrussServiceProvider.php
+│   ├── Introspection/               # pure schema-building logic
+│   │   ├── CLAUDE.md
+│   │   ├── SnapshotBuilder.php
+│   │   ├── SchemaSerializer.php
+│   │   └── Data/                    # value objects: Table, Column, ForeignKey, Index
+│   ├── Cache/
+│   │   └── SchemaCacheRepository.php
+│   ├── Diff/                        # pure schema diff + baseline persistence
+│   │   ├── SchemaDiffer.php         # pure: two snapshots → structural diff
+│   │   └── BaselineStore.php        # structure-only baseline file on a disk
+│   ├── Commands/
+│   │   ├── RebuildCommand.php       # truss:rebuild
+│   │   └── DiffCommand.php          # truss:diff
+│   ├── Http/
+│   │   ├── Controllers/
+│   │   │   ├── IndexController.php
+│   │   │   ├── SchemaApiController.php
+│   │   │   └── AssetController.php   # serves JS/CSS/fonts + vendored Mermaid (gated, no publish)
+│   │   └── Middleware/
+│   │       └── Authorize.php
+│   └── Listeners/
+│       └── RebuildOnMigrationsEnded.php
+├── resources/
+│   ├── views/
+│   │   └── index.blade.php          # Blade shell (toolbar, banners, viewport)
+│   ├── css/
+│   │   └── truss.css                # Blueprint theme (light+dark), incl. Mermaid SVG theming
+│   ├── fonts/                       # vendored IBM Plex Mono woff2 (OFL), self-hosted, no CDN
+│   └── js/                          # client-side, no build step; served by AssetController
+│       ├── truss.js                 # browser entry: fetch → select → Mermaid render
+│       ├── mermaid-definition.js    # schema subset → erDiagram string (the generator)
+│       ├── selection.js             # filter + focus reducers
+│       ├── table-match.js           # substring matcher + ranking for the Focus picker
+│       ├── focus-combobox.js        # the Focus picker widget (ARIA combobox + listbox)
+│       ├── diff-view.js             # schema-diff render model (statuses, panel list)
+│       ├── type-labels.js           # native → Laravel-style short label
+│       └── vendor/
+│           └── mermaid.min.js       # vendored Mermaid (MIT), self-hosted, no CDN
+└── tests/
+    ├── TestCase.php
+    ├── Unit/
+    │   ├── Introspection/
+    │   └── Cache/
+    ├── Feature/
+    │   └── Http/                     # IndexRoute, SchemaApi, Authorization, Asset
+    ├── js/                           # Vitest unit tests for resources/js
+    └── e2e/                          # Playwright browser tests (harness + specs)
+```
+
+> Note: the Mermaid definition generator is **client-side JavaScript**
+> (`resources/js/mermaid-definition.js`), not PHP — the interactive
+> filter/focus/label pipeline runs in the browser with no refetch, so generation
+> must live there too. Pure logic is unit-tested with Vitest; rendering and
+> interaction are covered by Playwright.
